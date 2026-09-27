@@ -24,11 +24,13 @@
 //! ```
 //!
 //! See [`repository`] for the storage model and ID round-trip details.
+mod entity_index;
 pub mod error;
 pub mod graph;
 mod json_references;
 pub mod query_adapter;
 pub mod repository;
+pub use entity_index::ensure_json_index;
 pub use error::map_sqlite_error;
 pub use graph::SqliteGraphRepository;
 pub use json_references::install_json_references;

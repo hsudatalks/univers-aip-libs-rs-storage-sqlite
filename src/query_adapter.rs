@@ -82,23 +82,8 @@ impl SqliteQueryAdapter {
         let path = field.strip_prefix("encoded_metadata.").unwrap_or_default();
         let metadata = "json_extract(data, '$.metadata')";
         let parsed = format!("CASE WHEN json_valid({metadata}) THEN {metadata} ELSE NULL END");
-        let value = |key: &str| {
-            format!(
-                "CASE WHEN json_type({parsed}, '$.{key}') = 'text' THEN json_extract({parsed}, '$.{key}') END"
-            )
-        };
-
-        // Ownership historically accepted both spellings and defaults to the
-        // default organization when no ownership key was persisted. Keeping
-        // that rule in the storage expression makes the bounded page exact.
-        if path == "organization_id" {
-            return format!(
-                "COALESCE(NULLIF(trim({}), ''), NULLIF(trim({}), ''), 'default')",
-                value("organization_id"),
-                value("organizationId")
-            );
-        }
-
+        // The field path is exact. Missing metadata or keys remain SQL NULL;
+        // callers own any alias or legacy tenant migration policy.
         format!("json_extract({parsed}, '$.{path}')")
     }
 
@@ -795,7 +780,7 @@ mod tests {
     }
 
     #[test]
-    fn encoded_metadata_scope_query_unwraps_legacy_json_and_defaults_safely() {
+    fn encoded_metadata_query_unwraps_json_without_assigning_ownership() {
         let builder = QueryBuilder::new()
             .eq("encoded_metadata.organization_id", "org-a")
             .order_by("id", SortDirection::Asc)
@@ -805,11 +790,56 @@ mod tests {
         assert!(q
             .sql
             .contains("json_valid(json_extract(data, '$.metadata'))"));
-        assert!(q.sql.contains("COALESCE(NULLIF(trim("));
+        assert!(q.sql.contains("'$.organization_id'"));
+        assert!(!q.sql.contains("COALESCE"));
+        assert!(!q.sql.contains("'default'"));
         assert!(q.sql.contains("ORDER BY id ASC"));
         assert!(q.sql.contains("LIMIT 20"));
         assert!(q.sql.contains("OFFSET 40"));
         assert_eq!(q.params.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn missing_or_aliased_encoded_owner_remains_absent_in_sqlite() {
+        let pool = crate::open_in_memory().await.unwrap();
+        sqlx::query("CREATE TABLE entries (id TEXT PRIMARY KEY, data TEXT NOT NULL)")
+            .execute(pool.as_ref())
+            .await
+            .unwrap();
+        for (id, data) in [
+            ("missing", serde_json::json!({"title": "old"})),
+            (
+                "snake",
+                serde_json::json!({"metadata": r#"{"organization_id":"org-a"}"#}),
+            ),
+            (
+                "camel",
+                serde_json::json!({"metadata": r#"{"organizationId":"org-b"}"#}),
+            ),
+            ("malformed", serde_json::json!({"metadata": "not-json"})),
+        ] {
+            sqlx::query("INSERT INTO entries (id, data) VALUES (?, ?)")
+                .bind(id)
+                .bind(data.to_string())
+                .execute(pool.as_ref())
+                .await
+                .unwrap();
+        }
+        let expr = SqliteQueryAdapter::field_expr("encoded_metadata.organization_id");
+        let sql = format!("SELECT {expr} FROM entries WHERE id = ?");
+        for (id, expected) in [
+            ("missing", None),
+            ("snake", Some("org-a")),
+            ("camel", None),
+            ("malformed", None),
+        ] {
+            let owner: Option<String> = sqlx::query_scalar(&sql)
+                .bind(id)
+                .fetch_one(pool.as_ref())
+                .await
+                .unwrap();
+            assert_eq!(owner.as_deref(), expected, "row {id}");
+        }
     }
 
     #[test]
