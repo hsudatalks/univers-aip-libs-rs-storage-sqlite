@@ -41,3 +41,11 @@ Add `univers-aip-lib-storage-sqlite = {version="=0.1.1", registry="univers"}`.
 The release lock validates C0 Data and Operation rc.2. Run
 `bash scripts/check.sh`, `bash scripts/build.sh`, and from a clean committed
 candidate `bash scripts/publish.sh`. Credentials remain outside Git.
+
+Record IDs remove only the current repository's `<table>:` prefix. A key such
+as `planning:proposal_lifecycle` remains distinct from
+`inspection:proposal_lifecycle` and `proposal_lifecycle`, including CAS updates,
+bulk reads and deletes. Materialization restores the table prefix while keeping
+the complete key. Older versions truncated at the last colon; already truncated
+rows cannot be attributed to a namespace safely and are not automatically
+aliased or migrated by this fix.

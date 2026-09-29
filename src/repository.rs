@@ -176,7 +176,7 @@ where
         // `version` and every other field round-trip from the entity's own JSON
         // `data` — matching SurrealDB, so entities with any version type
         // (u64 / String / …) deserialize correctly.
-        let full_id = if id.contains(':') {
+        let full_id = if id.starts_with(&format!("{}:", self.table)) {
             id
         } else {
             format!("{}:{}", self.table, id)
@@ -202,11 +202,12 @@ fn bind_param<'q>(
     }
 }
 
-/// Strip a Surreal-style `"table:id"` prefix, leaving the bare record id.
-/// `rsplit(':')` takes everything after the last colon, matching the
-/// SurrealDB RecordId format used across the codebase.
-fn bare_id(id: &str) -> &str {
-    id.rsplit(':').next().unwrap_or(id)
+/// Remove only this repository's table prefix. Colons inside a record key
+/// belong to its namespace and must survive reads, writes and materialization.
+fn bare_id<'a>(table: &str, id: &'a str) -> &'a str {
+    id.strip_prefix(table)
+        .and_then(|rest| rest.strip_prefix(':'))
+        .unwrap_or(id)
 }
 
 /// Serialize `D` to a JSON string for storage.
@@ -246,7 +247,7 @@ where
 
         // ON CONFLICT(id) DO NOTHING -> duplicate id yields no row -> Ok(None).
         let row = sqlx::query(&sql)
-            .bind(bare_id(id))
+            .bind(bare_id(&self.table, id))
             .bind(json.as_str())
             .bind(&now)
             .bind(&now)
@@ -265,7 +266,7 @@ where
 
         let sql = SqliteQueryAdapter::build_select_by_id(&self.table, self.soft_delete);
         let row = sqlx::query(&sql)
-            .bind(bare_id(id))
+            .bind(bare_id(&self.table, id))
             .fetch_optional(&*self.pool)
             .await
             .map_err(map_sqlite_error)?;
@@ -288,7 +289,7 @@ where
                 SqliteQueryAdapter::build_select_in(&self.table, chunk.len(), self.soft_delete);
             let mut query = sqlx::query(&sql);
             for id in chunk {
-                query = query.bind(bare_id(id));
+                query = query.bind(bare_id(&self.table, id));
             }
             let rows = query
                 .fetch_all(&*self.pool)
@@ -315,7 +316,7 @@ where
         let row = sqlx::query(&sql)
             .bind(json.as_str())
             .bind(&now)
-            .bind(bare_id(id))
+            .bind(bare_id(&self.table, id))
             .fetch_optional(&*self.pool)
             .await
             .map_err(map_sqlite_error)?;
@@ -345,7 +346,7 @@ where
         let row = sqlx::query(&sql)
             .bind(json.as_str())
             .bind(&now)
-            .bind(bare_id(id))
+            .bind(bare_id(&self.table, id))
             .bind(expected_version)
             .fetch_optional(&*self.pool)
             .await
@@ -380,7 +381,7 @@ where
         let row = sqlx::query(&sql)
             .bind(json.as_str())
             .bind(&now)
-            .bind(bare_id(id))
+            .bind(bare_id(&self.table, id))
             .bind(expected_version)
             .fetch_optional(&*self.pool)
             .await
@@ -412,7 +413,7 @@ where
         let row = sqlx::query(&sql)
             .bind(json.as_str())
             .bind(&now)
-            .bind(bare_id(id))
+            .bind(bare_id(&self.table, id))
             .bind(expected_version)
             .fetch_optional(&*self.pool)
             .await
@@ -430,14 +431,14 @@ where
             let sql = SqliteQueryAdapter::build_soft_delete(&self.table);
             sqlx::query(&sql)
                 .bind(&now)
-                .bind(bare_id(id))
+                .bind(bare_id(&self.table, id))
                 .fetch_optional(&*self.pool)
                 .await
                 .map_err(map_sqlite_error)?
         } else {
             let sql = SqliteQueryAdapter::build_delete(&self.table);
             sqlx::query(&sql)
-                .bind(bare_id(id))
+                .bind(bare_id(&self.table, id))
                 .fetch_optional(&*self.pool)
                 .await
                 .map_err(map_sqlite_error)?
@@ -462,7 +463,7 @@ where
             let sql = SqliteQueryAdapter::build_soft_delete_with_version(&self.table);
             sqlx::query(&sql)
                 .bind(&now)
-                .bind(bare_id(id))
+                .bind(bare_id(&self.table, id))
                 .bind(expected_version)
                 .fetch_optional(&*self.pool)
                 .await
@@ -470,7 +471,7 @@ where
         } else {
             let sql = SqliteQueryAdapter::build_delete_with_version(&self.table);
             sqlx::query(&sql)
-                .bind(bare_id(id))
+                .bind(bare_id(&self.table, id))
                 .bind(expected_version)
                 .fetch_optional(&*self.pool)
                 .await
@@ -605,7 +606,7 @@ where
             for id in ids {
                 let row = sqlx::query(&sql)
                     .bind(&now)
-                    .bind(bare_id(id))
+                    .bind(bare_id(&self.table, id))
                     .fetch_optional(&mut *tx)
                     .await
                     .map_err(map_sqlite_error)?;
@@ -615,7 +616,7 @@ where
             let sql = SqliteQueryAdapter::build_delete(&self.table);
             for id in ids {
                 let row = sqlx::query(&sql)
-                    .bind(bare_id(id))
+                    .bind(bare_id(&self.table, id))
                     .fetch_optional(&mut *tx)
                     .await
                     .map_err(map_sqlite_error)?;

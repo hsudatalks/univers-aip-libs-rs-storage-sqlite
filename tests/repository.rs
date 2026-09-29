@@ -1037,3 +1037,103 @@ async fn delete_by_tag_matches_array_membership() {
         "empty tag must be rejected"
     );
 }
+
+#[tokio::test]
+async fn namespaced_record_keys_round_trip_without_colliding_on_their_suffix() {
+    let pool = open_in_memory().await.unwrap();
+    let repo = JsonRepo::new(pool.clone(), "workflows");
+    for (key, name) in [
+        ("workflows:planning:proposal_lifecycle", "planning"),
+        ("inspection:proposal_lifecycle", "inspection"),
+        ("proposal_lifecycle", "legacy bare key"),
+    ] {
+        let created = repo
+            .create_with_id(key, serde_json::json!({"name":name,"version":0}))
+            .await
+            .unwrap()
+            .unwrap();
+        let bare = key.strip_prefix("workflows:").unwrap_or(key);
+        assert_eq!(created["id"], format!("workflows:{bare}"));
+        assert_eq!(repo.find_by_id(bare).await.unwrap(), Some(created.clone()));
+        assert_eq!(
+            repo.find_by_id(&format!("workflows:{bare}")).await.unwrap(),
+            Some(created)
+        );
+    }
+    assert_eq!(repo.count().await.unwrap(), 3);
+    assert!(repo
+        .create_with_id(
+            "planning:proposal_lifecycle",
+            serde_json::json!({"version":0})
+        )
+        .await
+        .unwrap()
+        .is_none());
+    let updated = repo
+        .update_with_version(
+            "workflows:planning:proposal_lifecycle",
+            serde_json::json!({"name":"granted","version":1}),
+            0,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(updated["id"], "workflows:planning:proposal_lifecycle");
+    assert!(repo
+        .update_with_version(
+            "planning:proposal_lifecycle",
+            serde_json::json!({"version":2}),
+            0
+        )
+        .await
+        .unwrap()
+        .is_none());
+    let reopened = JsonRepo::new(pool, "workflows");
+    assert_eq!(
+        reopened
+            .find_by_id("planning:proposal_lifecycle")
+            .await
+            .unwrap()
+            .unwrap()["name"],
+        "granted"
+    );
+    assert_eq!(
+        reopened
+            .find_by_id("inspection:proposal_lifecycle")
+            .await
+            .unwrap()
+            .unwrap()["name"],
+        "inspection"
+    );
+    assert_eq!(
+        reopened
+            .find_by_ids(vec![
+                "planning:proposal_lifecycle",
+                "workflows:inspection:proposal_lifecycle"
+            ])
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(reopened
+        .delete_with_version("workflows:planning:proposal_lifecycle", 1)
+        .await
+        .unwrap()
+        .is_some());
+    assert!(reopened
+        .find_by_id("planning:proposal_lifecycle")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(reopened
+        .find_by_id("inspection:proposal_lifecycle")
+        .await
+        .unwrap()
+        .is_some());
+    assert!(reopened
+        .find_by_id("proposal_lifecycle")
+        .await
+        .unwrap()
+        .is_some());
+}
