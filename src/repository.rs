@@ -25,8 +25,10 @@
 //! bare id in the `id` column. On read we deserialize the `data` JSON and
 //! inject `"id": "<table>:<id>"`; version remains part of the JSON entity so
 //! the entity reconstructs exactly as SurrealDB/PostgreSQL backends materialize it. Callers may pass
-//! either a bare id or a `"table:id"` RecordId string; the table prefix is
-//! stripped before lookup so both forms resolve.
+//! either a bare id or a `"table:id"` RecordId string; only the exact current
+//! table prefix is stripped once before lookup. Nested keys remain intact.
+//! A key beginning with `"table:"` must use its fully qualified
+//! `"table:table:key"` form to distinguish it from a qualified ordinary key.
 //!
 //! Tables are created lazily and idempotently (`CREATE TABLE IF NOT EXISTS`)
 //! on first use, so a fresh database file needs no migrations.
@@ -176,11 +178,9 @@ where
         // `version` and every other field round-trip from the entity's own JSON
         // `data` — matching SurrealDB, so entities with any version type
         // (u64 / String / …) deserialize correctly.
-        let full_id = if id.starts_with(&format!("{}:", self.table)) {
-            id
-        } else {
-            format!("{}:{}", self.table, id)
-        };
+        // The physical id is always a key, even when the key itself starts
+        // with this table's name. Never infer qualification from stored bytes.
+        let full_id = format!("{}:{}", self.table, id);
         map.insert("id".to_string(), serde_json::Value::String(full_id));
 
         serde_json::from_value(data).map_err(|e| {
