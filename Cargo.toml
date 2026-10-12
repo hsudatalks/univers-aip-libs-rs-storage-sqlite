@@ -1,6 +1,6 @@
 [package]
 name = "univers-aip-lib-storage-sqlite"
-version = "0.1.1"
+version = "0.1.2-dev.20261012.1"
 edition = "2021"
 rust-version = "1.89"
 license = "MIT"
@@ -25,4 +25,4 @@ chrono={version="0.4",features=["serde","clock"]}
 univers-aip-contracts-data={version=">=1.0.0-rc.2, <1.0.0",registry="univers",default-features=false,features=["storage","storage-full"]}
 [dev-dependencies]
 tokio={version="1",features=["rt-multi-thread","macros"]}
-univers-aip-contracts-operation={version="=1.0.0-rc.2",registry="univers",default-features=false,features=["task"]}
+univers-aip-contracts-operation={version=">=1.0.0-rc.2, <1.0.0",registry="univers",default-features=false,features=["task"]}

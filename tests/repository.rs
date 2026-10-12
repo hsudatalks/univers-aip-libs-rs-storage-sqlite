@@ -5,7 +5,9 @@
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use univers_aip_contracts_data::storage::{QueryBuilder, RepositoryTrait, SortDirection};
-use univers_aip_lib_storage_sqlite::{open_in_memory, SqliteRepository, SqliteWriteCoordinator};
+use univers_aip_lib_storage_sqlite::{
+    open_in_memory, SqliteIdCodec, SqliteRepository, SqliteWriteCoordinator,
+};
 
 /// Full entity (id injected on read; version comes from `data`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -122,6 +124,119 @@ async fn find_by_id_resolves_both_bare_and_prefixed_forms() {
     // full "table:id" form
     let by_prefixed = repo.find_by_id(&e.id).await.unwrap();
     assert_eq!(by_prefixed.as_ref().unwrap(), &e);
+}
+
+#[tokio::test]
+async fn data_legacy_codec_is_default_for_all_constructors_and_mutations() {
+    for constructor in 0..4 {
+        let pool = open_in_memory().await.unwrap();
+        let coordinator = SqliteWriteCoordinator::default();
+        let repo = match constructor {
+            0 => JsonRepo::new(pool.clone(), "artifacts"),
+            1 => JsonRepo::with_write_coordinator(pool.clone(), "artifacts", coordinator),
+            2 => JsonRepo::with_soft_delete(pool.clone(), "artifacts"),
+            _ => JsonRepo::with_soft_delete_and_write_coordinator(
+                pool.clone(),
+                "artifacts",
+                coordinator,
+            ),
+        };
+        let created = repo
+            .create_with_id("ignored:nested:raw-id", serde_json::json!({"version":0}))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(created["id"], "artifacts:raw-id");
+        for id in ["raw-id", "artifacts:raw-id", "ignored:raw-id"] {
+            assert_eq!(repo.find_by_id(id).await.unwrap(), Some(created.clone()));
+        }
+        assert_eq!(
+            repo.find_by_ids(vec!["ignored:raw-id"]).await.unwrap(),
+            vec![created]
+        );
+        let updated = repo
+            .update("ignored:raw-id", serde_json::json!({"version":1}))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated["id"], "artifacts:raw-id");
+        assert!(repo
+            .update_with_version("ignored:raw-id", serde_json::json!({"version":2}), 1)
+            .await
+            .unwrap()
+            .is_some());
+        let physical: String = sqlx::query_scalar("SELECT id FROM artifacts")
+            .fetch_one(pool.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(physical, "raw-id");
+        assert_eq!(
+            repo.delete_batch(vec!["ignored:raw-id"]).await.unwrap()[0]
+                .as_ref()
+                .unwrap()["id"],
+            "artifacts:raw-id"
+        );
+        assert!(repo.find_by_id("raw-id").await.unwrap().is_none());
+    }
+}
+
+#[tokio::test]
+async fn data_legacy_codec_materializes_historical_colon_ids_verbatim() {
+    let pool = open_in_memory().await.unwrap();
+    let repo = JsonRepo::new(pool.clone(), "artifacts");
+    repo.ensure_table().await.unwrap();
+    for id in ["raw-id", "historical:colon", "artifacts:nested:colon"] {
+        sqlx::query("INSERT INTO artifacts VALUES (?, ?, 'old-created', 'old-updated', NULL)")
+            .bind(id)
+            .bind(serde_json::json!({"name":id,"record_version":3}).to_string())
+            .execute(pool.as_ref())
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        repo.find_by_id("ignored:raw-id").await.unwrap().unwrap()["id"],
+        "artifacts:raw-id"
+    );
+    for rows in [
+        repo.list().await.unwrap(),
+        repo.query_safe(QueryBuilder::new()).await.unwrap(),
+        repo.list_paginated(0, 10).await.unwrap().items,
+    ] {
+        for row in rows {
+            let physical = row["name"].as_str().unwrap();
+            let expected = if physical.contains(':') {
+                physical.to_string()
+            } else {
+                format!("artifacts:{physical}")
+            };
+            assert_eq!(row["id"], expected);
+            assert_eq!(row["record_version"], 3);
+        }
+    }
+    // Issued lookup semantics do not make historical colon bytes addressable:
+    // reads strip to the final segment, while list/query preserve those bytes.
+    assert!(repo.find_by_id("historical:colon").await.unwrap().is_none());
+    assert!(repo
+        .find_by_ids(vec!["historical:colon"])
+        .await
+        .unwrap()
+        .is_empty());
+    let reopened = JsonRepo::new(pool.clone(), "artifacts");
+    assert_eq!(
+        reopened
+            .query_safe(QueryBuilder::new().eq("name", "historical:colon"))
+            .await
+            .unwrap()[0]["id"],
+        "historical:colon"
+    );
+    let physical: Vec<String> = sqlx::query_scalar("SELECT id FROM artifacts ORDER BY id")
+        .fetch_all(pool.as_ref())
+        .await
+        .unwrap();
+    assert_eq!(
+        physical,
+        ["artifacts:nested:colon", "historical:colon", "raw-id"]
+    );
 }
 
 #[tokio::test]
@@ -1036,4 +1151,340 @@ async fn delete_by_tag_matches_array_membership() {
             .is_err(),
         "empty tag must be rejected"
     );
+}
+
+#[tokio::test]
+async fn namespaced_record_keys_round_trip_without_colliding_on_their_suffix() {
+    let pool = open_in_memory().await.unwrap();
+    let repo =
+        JsonRepo::new(pool.clone(), "workflows").with_id_codec(SqliteIdCodec::TableQualified);
+    for (key, name) in [
+        ("workflows:planning:proposal_lifecycle", "planning"),
+        ("inspection:proposal_lifecycle", "inspection"),
+        ("proposal_lifecycle", "legacy bare key"),
+    ] {
+        let created = repo
+            .create_with_id(key, serde_json::json!({"name":name,"version":0}))
+            .await
+            .unwrap()
+            .unwrap();
+        let bare = key.strip_prefix("workflows:").unwrap_or(key);
+        assert_eq!(created["id"], format!("workflows:{bare}"));
+        assert_eq!(repo.find_by_id(bare).await.unwrap(), Some(created.clone()));
+        assert_eq!(
+            repo.find_by_id(&format!("workflows:{bare}")).await.unwrap(),
+            Some(created)
+        );
+    }
+    assert_eq!(repo.count().await.unwrap(), 3);
+    assert!(repo
+        .create_with_id(
+            "planning:proposal_lifecycle",
+            serde_json::json!({"version":0})
+        )
+        .await
+        .unwrap()
+        .is_none());
+    let updated = repo
+        .update_with_version(
+            "workflows:planning:proposal_lifecycle",
+            serde_json::json!({"name":"granted","version":1}),
+            0,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(updated["id"], "workflows:planning:proposal_lifecycle");
+    assert!(repo
+        .update_with_version(
+            "planning:proposal_lifecycle",
+            serde_json::json!({"version":2}),
+            0
+        )
+        .await
+        .unwrap()
+        .is_none());
+    let reopened = JsonRepo::new(pool, "workflows").with_id_codec(SqliteIdCodec::TableQualified);
+    assert_eq!(
+        reopened
+            .find_by_id("planning:proposal_lifecycle")
+            .await
+            .unwrap()
+            .unwrap()["name"],
+        "granted"
+    );
+    assert_eq!(
+        reopened
+            .find_by_id("inspection:proposal_lifecycle")
+            .await
+            .unwrap()
+            .unwrap()["name"],
+        "inspection"
+    );
+    assert_eq!(
+        reopened
+            .find_by_ids(vec![
+                "planning:proposal_lifecycle",
+                "workflows:inspection:proposal_lifecycle"
+            ])
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(reopened
+        .delete_with_version("workflows:planning:proposal_lifecycle", 1)
+        .await
+        .unwrap()
+        .is_some());
+    assert!(reopened
+        .find_by_id("planning:proposal_lifecycle")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(reopened
+        .find_by_id("inspection:proposal_lifecycle")
+        .await
+        .unwrap()
+        .is_some());
+    assert!(reopened
+        .find_by_id("proposal_lifecycle")
+        .await
+        .unwrap()
+        .is_some());
+}
+
+#[tokio::test]
+async fn nested_table_prefix_keys_preserve_physical_identity_across_crud() {
+    let pool = open_in_memory().await.unwrap();
+    let repo =
+        JsonRepo::new(pool.clone(), "workflows").with_id_codec(SqliteIdCodec::TableQualified);
+    let ids = [
+        "workflows:planning:proposal_lifecycle",
+        "workflows:planning:nested:proposal_lifecycle",
+        "workflows:workflows:planning:proposal_lifecycle",
+        "workflows:other_table:planning:proposal_lifecycle",
+        "workflows:workflows_extra:proposal_lifecycle",
+    ];
+    for id in ids {
+        let created = repo
+            .create_with_id(id, serde_json::json!({"name":id,"version":0}))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(created["id"], id);
+        assert_eq!(repo.find_by_id(id).await.unwrap(), Some(created));
+    }
+    let physical: Vec<String> = sqlx::query_scalar("SELECT id FROM workflows ORDER BY id")
+        .fetch_all(&*pool)
+        .await
+        .unwrap();
+    let mut expected: Vec<_> = ids
+        .iter()
+        .map(|id| id.strip_prefix("workflows:").unwrap().to_string())
+        .collect();
+    expected.sort();
+    assert_eq!(physical, expected);
+    assert_eq!(
+        repo.find_by_ids(ids.to_vec()).await.unwrap().len(),
+        ids.len()
+    );
+    for rows in [
+        repo.list().await.unwrap(),
+        repo.query_safe(QueryBuilder::new()).await.unwrap(),
+        repo.list_paginated(0, 10).await.unwrap().items,
+    ] {
+        let mut returned: Vec<_> = rows.iter().map(|row| row["id"].as_str().unwrap()).collect();
+        returned.sort();
+        let mut expected = ids.to_vec();
+        expected.sort();
+        assert_eq!(returned, expected);
+    }
+    let nested = ids[2];
+    let changed = repo
+        .update(nested, serde_json::json!({"name":"updated","version":1}))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(changed["id"], nested);
+    assert!(repo
+        .update_with_version(nested, serde_json::json!({"version":2}), 0)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        repo.update_with_version(nested, serde_json::json!({"version":2}), 1)
+            .await
+            .unwrap()
+            .unwrap()["id"],
+        nested
+    );
+    assert!(repo.delete_with_version(nested, 1).await.unwrap().is_none());
+    assert_eq!(
+        repo.delete_with_version(nested, 2).await.unwrap().unwrap()["id"],
+        nested
+    );
+    assert_eq!(repo.delete(ids[1]).await.unwrap().unwrap()["id"], ids[1]);
+    let deleted = repo.delete_batch(vec![ids[3], ids[4]]).await.unwrap();
+    assert_eq!(deleted[0].as_ref().unwrap()["id"], ids[3]);
+    assert_eq!(deleted[1].as_ref().unwrap()["id"], ids[4]);
+    assert_eq!(repo.count().await.unwrap(), 1);
+    assert_eq!(
+        repo.find_by_id(ids[0]).await.unwrap().unwrap()["name"],
+        ids[0]
+    );
+}
+
+#[tokio::test]
+async fn legacy_short_rows_are_never_namespace_aliases_and_survive_reopen() {
+    let path =
+        std::env::temp_dir().join(format!("sqlite-namespace-{}.sqlite", uuid::Uuid::new_v4()));
+    let url = format!("sqlite://{}?mode=rwc", path.display());
+    let pool = univers_aip_lib_storage_sqlite::open_with_limits(
+        &url,
+        1,
+        std::time::Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    let repo =
+        JsonRepo::new(pool.clone(), "workflows").with_id_codec(SqliteIdCodec::TableQualified);
+    let legacy = repo
+        .create_with_id(
+            "proposal_lifecycle",
+            serde_json::json!({"name":"historical","version":7}),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    for id in [
+        "workflows:planning:proposal_lifecycle",
+        "workflows:namespace_probe:proposal_lifecycle",
+    ] {
+        assert!(repo.find_by_id(id).await.unwrap().is_none());
+        assert!(repo
+            .update(id, serde_json::json!({"version":8}))
+            .await
+            .unwrap()
+            .is_none());
+        assert!(repo.delete(id).await.unwrap().is_none());
+    }
+    assert_eq!(
+        repo.find_by_id("proposal_lifecycle").await.unwrap(),
+        Some(legacy.clone())
+    );
+    for namespace in ["planning", "namespace_probe"] {
+        let id = format!("workflows:{namespace}:proposal_lifecycle");
+        let created = repo
+            .create_with_id(&id, serde_json::json!({"name":namespace,"version":0}))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(created["id"], id);
+        assert!(repo
+            .create_with_id(&id, serde_json::json!({"version":99}))
+            .await
+            .unwrap()
+            .is_none());
+    }
+    assert_eq!(repo.count().await.unwrap(), 3);
+    pool.close().await;
+    drop(repo);
+    drop(pool);
+    let reopened = univers_aip_lib_storage_sqlite::open_with_limits(
+        &url,
+        1,
+        std::time::Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    let repo =
+        JsonRepo::new(reopened.clone(), "workflows").with_id_codec(SqliteIdCodec::TableQualified);
+    assert_eq!(
+        repo.find_by_id("proposal_lifecycle").await.unwrap(),
+        Some(legacy)
+    );
+    assert_eq!(
+        repo.find_by_id("workflows:planning:proposal_lifecycle")
+            .await
+            .unwrap()
+            .unwrap()["name"],
+        "planning"
+    );
+    assert_eq!(
+        repo.find_by_id("workflows:namespace_probe:proposal_lifecycle")
+            .await
+            .unwrap()
+            .unwrap()["name"],
+        "namespace_probe"
+    );
+    reopened.close().await;
+    std::fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn namespaced_soft_deletes_keep_rows_and_never_delete_sibling_namespaces() {
+    let pool = open_in_memory().await.unwrap();
+    let repo = JsonRepo::with_soft_delete(pool.clone(), "workflows")
+        .with_id_codec(SqliteIdCodec::TableQualified);
+    for id in [
+        "workflows:planning:proposal_lifecycle",
+        "workflows:namespace_probe:proposal_lifecycle",
+        "workflows:workflows:nested:proposal_lifecycle",
+    ] {
+        assert_eq!(
+            repo.create_with_id(id, serde_json::json!({"version":1}))
+                .await
+                .unwrap()
+                .unwrap()["id"],
+            id
+        );
+    }
+    assert!(repo
+        .delete_with_version("planning:proposal_lifecycle", 0)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        repo.delete_with_version("planning:proposal_lifecycle", 1)
+            .await
+            .unwrap()
+            .unwrap()["id"],
+        "workflows:planning:proposal_lifecycle"
+    );
+    assert!(repo
+        .find_by_id("planning:proposal_lifecycle")
+        .await
+        .unwrap()
+        .is_none());
+    let deleted = repo
+        .delete_batch(vec!["workflows:workflows:nested:proposal_lifecycle"])
+        .await
+        .unwrap();
+    assert_eq!(
+        deleted[0].as_ref().unwrap()["id"],
+        "workflows:workflows:nested:proposal_lifecycle"
+    );
+    assert_eq!(repo.list().await.unwrap().len(), 1);
+    assert_eq!(
+        repo.find_by_id("namespace_probe:proposal_lifecycle")
+            .await
+            .unwrap()
+            .unwrap()["id"],
+        "workflows:namespace_probe:proposal_lifecycle"
+    );
+    let retained: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM workflows WHERE deleted_at IS NOT NULL")
+            .fetch_one(&*pool)
+            .await
+            .unwrap();
+    assert_eq!(retained, 2);
+    assert!(repo
+        .create_with_id(
+            "planning:proposal_lifecycle",
+            serde_json::json!({"version":99})
+        )
+        .await
+        .unwrap()
+        .is_none());
 }

@@ -35,7 +35,7 @@ pub use error::map_sqlite_error;
 pub use graph::SqliteGraphRepository;
 pub use json_references::install_json_references;
 pub use query_adapter::{SqliteParam, SqliteQuery, SqliteQueryAdapter};
-pub use repository::{SqliteRepository, SqliteWriteCoordinator};
+pub use repository::{SqliteIdCodec, SqliteRepository, SqliteWriteCoordinator};
 /// Re-export so consumers can name the
 /// pool type without a direct `sqlx` dependency.
 pub use sqlx::sqlite::SqlitePool;

@@ -23,10 +23,13 @@
 //!
 //! `D` has no `id`; `T` does. On write we serialize `D` to JSON and store the
 //! bare id in the `id` column. On read we deserialize the `data` JSON and
-//! inject `"id": "<table>:<id>"`; version remains part of the JSON entity so
-//! the entity reconstructs exactly as SurrealDB/PostgreSQL backends materialize it. Callers may pass
-//! either a bare id or a `"table:id"` RecordId string; the table prefix is
-//! stripped before lookup so both forms resolve.
+//! inject the public ID selected by the codec; version remains part of the
+//! JSON entity. Callers may pass
+//! either a bare id or a qualified ID. The default [`SqliteIdCodec::DataLegacy`]
+//! strips everything through the last colon on lookup and preserves stored IDs
+//! containing a colon verbatim on materialization, matching issued Data SQLite.
+//! [`SqliteIdCodec::TableQualified`] explicitly opts into namespaced keys: it
+//! strips only this table's prefix once and always prefixes materialized IDs.
 //!
 //! Tables are created lazily and idempotently (`CREATE TABLE IF NOT EXISTS`)
 //! on first use, so a fresh database file needs no migrations.
@@ -60,6 +63,19 @@ impl SqliteWriteCoordinator {
     }
 }
 
+/// Public ID interpretation for a SQLite entity repository.
+///
+/// The codec affects IDs only; selecting it never rewrites stored rows.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SqliteIdCodec {
+    /// Issued Data behavior: last-colon lookup, stored colon IDs returned verbatim.
+    #[default]
+    DataLegacy,
+    /// Namespaced keys: strip this table's prefix once, always qualify on read.
+    /// A key beginning with `table:` uses `table:table:key` as its public ID.
+    TableQualified,
+}
+
 /// SQLite repository for entity type `T` (with id) and data type `D` (no id).
 ///
 /// Construct via [`SqliteRepository::new`] / [`SqliteRepository::with_soft_delete`],
@@ -68,6 +84,7 @@ pub struct SqliteRepository<T, D> {
     pool: Arc<sqlx::SqlitePool>,
     table: String,
     soft_delete: bool,
+    id_codec: SqliteIdCodec,
     table_ready: tokio::sync::OnceCell<()>,
     write_coordinator: SqliteWriteCoordinator,
     _phantom: PhantomData<(T, D)>,
@@ -93,6 +110,7 @@ where
             pool,
             table: table.into(),
             soft_delete: false,
+            id_codec: SqliteIdCodec::default(),
             table_ready: tokio::sync::OnceCell::new(),
             write_coordinator,
             _phantom: PhantomData,
@@ -116,9 +134,29 @@ where
             pool,
             table: table.into(),
             soft_delete: true,
+            id_codec: SqliteIdCodec::default(),
             table_ready: tokio::sync::OnceCell::new(),
             write_coordinator,
             _phantom: PhantomData,
+        }
+    }
+
+    /// Select an explicit ID codec before sharing this repository.
+    ///
+    /// All constructors default to [`SqliteIdCodec::DataLegacy`]. Use the same
+    /// codec when reopening an existing repository; this is not a data migration.
+    pub fn with_id_codec(mut self, id_codec: SqliteIdCodec) -> Self {
+        self.id_codec = id_codec;
+        self
+    }
+
+    fn bare_id<'a>(&self, id: &'a str) -> &'a str {
+        match self.id_codec {
+            SqliteIdCodec::DataLegacy => id.rsplit(':').next().unwrap_or(id),
+            SqliteIdCodec::TableQualified => id
+                .strip_prefix(&self.table)
+                .and_then(|rest| rest.strip_prefix(':'))
+                .unwrap_or(id),
         }
     }
 
@@ -154,10 +192,8 @@ where
 
     /// Materialize a fetched row into `T` using this instance's table name.
     ///
-    /// Reads the storage `id` / `data` / `version`, then injects the
-    /// `"<table>:<id>"` RecordId string and the storage-managed `version`
-    /// into the JSON object before deserializing, so the entity round-trips
-    /// exactly as SurrealDB/PostgreSQL backends materialize it.
+    /// Reads the storage `id` / `data`, then injects the public ID selected by
+    /// this repository's codec. Version and other fields remain in stored JSON.
     fn materialize(&self, row: sqlx::sqlite::SqliteRow) -> RepositoryResult<T> {
         let id: String = row.try_get("id").map_err(map_sqlite_error)?;
         let data_json: String = row.try_get("data").map_err(map_sqlite_error)?;
@@ -172,11 +208,11 @@ where
             ));
         };
 
-        // Inject the RecordId (kept in the `id` column) as a "table:id" string.
+        // Inject the public ID selected by the codec from the physical column.
         // `version` and every other field round-trip from the entity's own JSON
         // `data` — matching SurrealDB, so entities with any version type
         // (u64 / String / …) deserialize correctly.
-        let full_id = if id.contains(':') {
+        let full_id = if self.id_codec == SqliteIdCodec::DataLegacy && id.contains(':') {
             id
         } else {
             format!("{}:{}", self.table, id)
@@ -200,13 +236,6 @@ fn bind_param<'q>(
         SqliteParam::Bool(b) => query.bind(*b),
         SqliteParam::Null => query.bind(None::<String>),
     }
-}
-
-/// Strip a Surreal-style `"table:id"` prefix, leaving the bare record id.
-/// `rsplit(':')` takes everything after the last colon, matching the
-/// SurrealDB RecordId format used across the codebase.
-fn bare_id(id: &str) -> &str {
-    id.rsplit(':').next().unwrap_or(id)
 }
 
 /// Serialize `D` to a JSON string for storage.
@@ -246,7 +275,7 @@ where
 
         // ON CONFLICT(id) DO NOTHING -> duplicate id yields no row -> Ok(None).
         let row = sqlx::query(&sql)
-            .bind(bare_id(id))
+            .bind(self.bare_id(id))
             .bind(json.as_str())
             .bind(&now)
             .bind(&now)
@@ -265,7 +294,7 @@ where
 
         let sql = SqliteQueryAdapter::build_select_by_id(&self.table, self.soft_delete);
         let row = sqlx::query(&sql)
-            .bind(bare_id(id))
+            .bind(self.bare_id(id))
             .fetch_optional(&*self.pool)
             .await
             .map_err(map_sqlite_error)?;
@@ -288,7 +317,7 @@ where
                 SqliteQueryAdapter::build_select_in(&self.table, chunk.len(), self.soft_delete);
             let mut query = sqlx::query(&sql);
             for id in chunk {
-                query = query.bind(bare_id(id));
+                query = query.bind(self.bare_id(id));
             }
             let rows = query
                 .fetch_all(&*self.pool)
@@ -315,7 +344,7 @@ where
         let row = sqlx::query(&sql)
             .bind(json.as_str())
             .bind(&now)
-            .bind(bare_id(id))
+            .bind(self.bare_id(id))
             .fetch_optional(&*self.pool)
             .await
             .map_err(map_sqlite_error)?;
@@ -345,7 +374,7 @@ where
         let row = sqlx::query(&sql)
             .bind(json.as_str())
             .bind(&now)
-            .bind(bare_id(id))
+            .bind(self.bare_id(id))
             .bind(expected_version)
             .fetch_optional(&*self.pool)
             .await
@@ -380,7 +409,7 @@ where
         let row = sqlx::query(&sql)
             .bind(json.as_str())
             .bind(&now)
-            .bind(bare_id(id))
+            .bind(self.bare_id(id))
             .bind(expected_version)
             .fetch_optional(&*self.pool)
             .await
@@ -412,7 +441,7 @@ where
         let row = sqlx::query(&sql)
             .bind(json.as_str())
             .bind(&now)
-            .bind(bare_id(id))
+            .bind(self.bare_id(id))
             .bind(expected_version)
             .fetch_optional(&*self.pool)
             .await
@@ -430,14 +459,14 @@ where
             let sql = SqliteQueryAdapter::build_soft_delete(&self.table);
             sqlx::query(&sql)
                 .bind(&now)
-                .bind(bare_id(id))
+                .bind(self.bare_id(id))
                 .fetch_optional(&*self.pool)
                 .await
                 .map_err(map_sqlite_error)?
         } else {
             let sql = SqliteQueryAdapter::build_delete(&self.table);
             sqlx::query(&sql)
-                .bind(bare_id(id))
+                .bind(self.bare_id(id))
                 .fetch_optional(&*self.pool)
                 .await
                 .map_err(map_sqlite_error)?
@@ -462,7 +491,7 @@ where
             let sql = SqliteQueryAdapter::build_soft_delete_with_version(&self.table);
             sqlx::query(&sql)
                 .bind(&now)
-                .bind(bare_id(id))
+                .bind(self.bare_id(id))
                 .bind(expected_version)
                 .fetch_optional(&*self.pool)
                 .await
@@ -470,7 +499,7 @@ where
         } else {
             let sql = SqliteQueryAdapter::build_delete_with_version(&self.table);
             sqlx::query(&sql)
-                .bind(bare_id(id))
+                .bind(self.bare_id(id))
                 .bind(expected_version)
                 .fetch_optional(&*self.pool)
                 .await
@@ -605,7 +634,7 @@ where
             for id in ids {
                 let row = sqlx::query(&sql)
                     .bind(&now)
-                    .bind(bare_id(id))
+                    .bind(self.bare_id(id))
                     .fetch_optional(&mut *tx)
                     .await
                     .map_err(map_sqlite_error)?;
@@ -615,7 +644,7 @@ where
             let sql = SqliteQueryAdapter::build_delete(&self.table);
             for id in ids {
                 let row = sqlx::query(&sql)
-                    .bind(bare_id(id))
+                    .bind(self.bare_id(id))
                     .fetch_optional(&mut *tx)
                     .await
                     .map_err(map_sqlite_error)?;

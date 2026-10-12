@@ -37,7 +37,20 @@ ascending/descending index as the old storage adapter. The caller selects the
 pool and table and owns index lifecycle; no owner DDL or migration policy is
 loaded from the environment.
 
-Add `univers-aip-lib-storage-sqlite = {version="=0.1.1", registry="univers"}`.
+Version 0.1.2-dev.20261012.1 preserves issued Data SQLite IDs by default in
+all four repository constructors (`SqliteIdCodec::DataLegacy`): lookups and
+mutations strip everything through the last colon, even another table prefix;
+stored IDs containing a colon materialize verbatim, while bare stored IDs gain
+the repository table prefix. This includes legacy namespace aliasing; no stored
+bytes are rewritten and no owner change is required for Data's lifecycle adapter.
+
+Consumers requiring the namespaced key behavior introduced in
+0.1.2-dev.20261002.1 must select
+`.with_id_codec(SqliteIdCodec::TableQualified)` after construction. That codec
+strips only the current table prefix once and always qualifies materialized IDs;
+use the same codec on reopen. Both codecs retain the graph-compatible adapter.
+
+Add `univers-aip-lib-storage-sqlite = {version=">=0.1.2-dev.20261012.1, <0.1.3", registry="univers"}`.
 The release lock validates C0 Data and Operation rc.2. Run
 `bash scripts/check.sh`, `bash scripts/build.sh`, and from a clean committed
 candidate `bash scripts/publish.sh`. Credentials remain outside Git.
