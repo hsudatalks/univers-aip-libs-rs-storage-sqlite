@@ -28,6 +28,7 @@ mod entity_index;
 pub mod error;
 pub mod graph;
 mod json_references;
+mod pool_open;
 pub mod query_adapter;
 pub mod repository;
 pub use entity_index::ensure_json_index;
@@ -60,7 +61,7 @@ pub struct EntityTableSyncReport {
 }
 
 use log::LevelFilter;
-use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection, SqliteJournalMode, SqlitePoolOptions};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{ConnectOptions, Connection, Row};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime};
@@ -90,7 +91,11 @@ pub use entity_snapshot::{
 /// traffic. Transaction durability remains SQLite's default FULL synchronous
 /// mode.
 ///
-/// Uses 64 connections and a five-second timeout. Callers that load deployment
+/// Uses 64 connections and five-second request acquisition/busy timeouts.
+/// Initial durable open has no wall-clock deadline; transient BUSY/LOCKED
+/// failures have bounded retries with phase diagnostics. WAL is selected once
+/// before the initialized connection is transferred into the pool.
+/// Callers that load deployment
 /// settings should pass those values explicitly to [`open_with_limits`].
 pub async fn open(url: &str) -> RepositoryResult<Arc<SqlitePool>> {
     open_with_limits(url, 64, Duration::from_secs(5)).await
@@ -100,17 +105,20 @@ pub async fn open(url: &str) -> RepositoryResult<Arc<SqlitePool>> {
 ///
 /// The caller owns pool sizing and timeout configuration. These explicit
 /// values allow independent consumers to choose their concurrency limits.
+/// `timeout` applies to requests, not initial durable storage setup. Startup
+/// uses a busy timeout of at least five seconds and at most eight attempts for
+/// transient errors; permanent errors fail immediately and name their phase.
 pub async fn open_with_limits(
     url: &str,
     max_connections: u32,
     timeout: Duration,
 ) -> RepositoryResult<Arc<SqlitePool>> {
     let opts = SqliteConnectOptions::from_str(url)
-        .map_err(|e| RepoError::connection(format!("Invalid SQLite URL '{url}': {e}")))?
+        .map_err(|e| RepoError::connection(format!("SQLite initial open phase URL parsing: {e}")))?
         .create_if_missing(true)
         .busy_timeout(timeout)
         .foreign_keys(true)
-        .journal_mode(SqliteJournalMode::Wal)
+        .synchronous(SqliteSynchronous::Full)
         .pragma("wal_autocheckpoint", "0");
     let wal_path = {
         let mut path = opts.get_filename().as_os_str().to_os_string();
@@ -123,17 +131,15 @@ pub async fn open_with_limits(
         .clone()
         .log_slow_statements(LevelFilter::Debug, Duration::from_secs(1));
 
-    let pool = SqlitePoolOptions::new()
+    let pool_options = SqlitePoolOptions::new()
         .max_connections(max_connections.max(1))
         .idle_timeout(POOL_IDLE_TIMEOUT)
         .acquire_timeout(timeout)
         // Cold-start schema work can hold SQLite connections slightly beyond
         // SQLx's 2s default. Keep genuine saturation visible before the 5s
         // shared-store timeout without reporting healthy startup as a warning.
-        .acquire_slow_threshold(timeout.min(Duration::from_secs(4)))
-        .connect_with(opts)
-        .await
-        .map_err(map_sqlite_error)?;
+        .acquire_slow_threshold(timeout.min(Duration::from_secs(4)));
+    let pool = pool_open::open_pool(opts, pool_options, timeout).await?;
 
     let pool = Arc::new(pool);
     spawn_passive_checkpoint_worker(Arc::downgrade(&pool), wal_path, checkpoint_opts);
@@ -152,20 +158,18 @@ pub async fn open_maintenance_pool(
     timeout: Duration,
 ) -> RepositoryResult<Arc<SqlitePool>> {
     let opts = SqliteConnectOptions::from_str(url)
-        .map_err(|e| RepoError::connection(format!("Invalid SQLite URL '{url}': {e}")))?
+        .map_err(|e| RepoError::connection(format!("SQLite initial open phase URL parsing: {e}")))?
         .create_if_missing(true)
         .busy_timeout(timeout)
         .foreign_keys(true)
-        .journal_mode(SqliteJournalMode::Wal)
+        .synchronous(SqliteSynchronous::Full)
         .pragma("wal_autocheckpoint", "0")
         .log_slow_statements(LevelFilter::Debug, Duration::from_secs(1));
-    let pool = SqlitePoolOptions::new()
+    let pool_options = SqlitePoolOptions::new()
         .max_connections(max_connections.max(1))
         .acquire_timeout(timeout)
-        .acquire_slow_threshold(timeout.min(Duration::from_secs(4)))
-        .connect_with(opts)
-        .await
-        .map_err(map_sqlite_error)?;
+        .acquire_slow_threshold(timeout.min(Duration::from_secs(4)));
+    let pool = pool_open::open_pool(opts, pool_options, timeout).await?;
     Ok(Arc::new(pool))
 }
 

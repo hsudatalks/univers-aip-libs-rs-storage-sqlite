@@ -6,11 +6,26 @@ schema migrations, explicit JSON references, and SQLite error classification.
 Consumers supply entity types, table names, schema definitions and scope policy.
 No Framework, World or Task implementation is a dependency.
 
-`open_with_limits(url, max_connections, timeout)` accepts explicit connection
-settings. `open(url)` uses fixed defaults of 64 connections and five seconds;
-it does not read environment variables. `open_in_memory()` provides an isolated
-single-connection test database. The existing WAL/passive checkpoint behavior is
-retained; maintenance callers own lifecycle coordination and database scope.
+`open_with_limits(url, max_connections, timeout)` accepts explicit request pool
+settings. `open(url)` uses 64 connections and five-second request acquisition and
+busy timeouts; it does not read environment variables. These limits do not cancel
+initial durable open on a slow disk. Startup opens a direct connection, configures
+connection-local pragmas, checks/selects WAL once, and transfers that connection
+into a ready pool. Subsequent request and checkpoint connections inherit the
+database's WAL mode without repeating the mode transition. FULL synchronous
+durability, foreign keys, disabled request auto-checkpoints, and the existing
+passive checkpoint policy are preserved. `open_maintenance_pool` uses the same
+startup path; maintenance callers own lifecycle coordination and database scope.
+
+Startup uses at least a five-second SQLite busy timeout and up to eight attempts
+per phase, with 25 ms exponential backoff capped at one second. Only BUSY/LOCKED
+(including extended codes) and interrupted/would-block transport errors retry.
+There is no wall-clock deadline around filesystem progress: an operating-system
+call that does not return still requires owner cancellation. Permission, missing
+directory, corruption and persistent I/O failures surface immediately as typed
+`RepositoryError` variants. Every startup diagnostic names the phase and attempt.
+After startup, caller-selected busy and pool acquisition timeouts still apply.
+`open_in_memory()` provides an isolated single-connection test database.
 
 Task Comment/Approval Notification writer fences are owner policy and were not
 moved into this library. Consumers requiring those triggers must retain them in
@@ -50,7 +65,23 @@ Consumers requiring the namespaced key behavior introduced in
 strips only the current table prefix once and always qualifies materialized IDs;
 use the same codec on reopen. Both codecs retain the graph-compatible adapter.
 
-Add `univers-aip-lib-storage-sqlite = {version=">=0.1.2-dev.20261012.1, <0.1.3", registry="univers"}`.
+Add `univers-aip-lib-storage-sqlite = {version=">=0.1.2-dev.20261013.1, <0.1.3", registry="univers"}`
+after this candidate's separate publication batch. Prereleases require explicit
+consumer admission; existing stable-only ranges do not select this candidate.
 The release lock validates C0 Data and Operation rc.2. Run
 `bash scripts/check.sh`, `bash scripts/build.sh`, and from a clean committed
 candidate `bash scripts/publish.sh`. Credentials remain outside Git.
+
+Linux reliability reproduction (a concurrent fsync-heavy writer plus a controlled
+6.25-second journal-fsync throttle; real fsync still runs, and the helper only
+affects task-owned files under `SQLPOOL1_ROOT`):
+
+```bash
+SQLPOOL1_ROOT="$HOME/.cache/univers/scratch/sqlpool1" \
+  bash scripts/sqlpool-pressure.sh cargo test --locked --test initial_open_pressure \
+  -- --ignored --nocapture
+```
+
+The test performs 30 opens across default, one-second explicit, and maintenance
+limits, then verifies write/reopen durability. Use `SQLPOOL1_RUNS=1` for the
+pre-fix reproduction. Retain evidence and remove task scratch when done.
